@@ -1,0 +1,24 @@
+{
+  "name": "iac-aws",
+  "version": "1.0.0",
+  "description": "IAC Pulumi",
+  "main": "index.ts",
+  "devDependencies": {
+    "@types/ip": "^1.1.1",
+    "@types/node": "^16",
+    "typescript": "^5.2.2"
+},
+"dependencies": {
+  "@pulumi/aws": "^5.0.0",
+  "@pulumi/awsx": "^1.0.0",
+  "@pulumi/pulumi": "^3.0.0",
+  "big-integer": "^1.6.51",
+  "ip": "^1.1.8"
+},
+  "scripts": {
+    "build": "tsc"
+  },
+  "author": "Nikhil Reddy Karukonda",
+  "license": "ISC"
+}
+
