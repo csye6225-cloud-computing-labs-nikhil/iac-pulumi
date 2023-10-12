@@ -80,6 +80,41 @@ aws.getAvailabilityZones().then(azs => {
         privateSubnets.push(privateSubnet);
     }
 
+    const publicRouteTable = new aws.ec2.RouteTable(publicRouteTableName, {
+        vpcId: vpc.id,
+        tags: {
+            Name: publicRouteTableName,
+        },
+    });
+
+    const publicRoute = new aws.ec2.Route(publicRouteName, {
+        routeTableId: publicRouteTable.id,
+        destinationCidrBlock: publicDestinationCidr,
+        gatewayId: internetGateway.id,
+    });
+
+    publicSubnets.forEach((subnet, i) => {
+        new aws.ec2.RouteTableAssociation(`${publicRouteTableSubnetsAssociationPrefix}-${i}`, {
+            subnetId: subnet.id,
+            routeTableId: publicRouteTable.id,
+        });
+    });
+
+    const privateRouteTable = new aws.ec2.RouteTable(privateRouteTableName, {
+        vpcId: vpc.id,
+        tags: {
+            Name: privateRouteTableName,
+        },
+    });
+
+    privateSubnets.forEach((subnet, i) => {
+        new aws.ec2.RouteTableAssociation(`${privateRouteTableSubnetsAssociationPrefix}-${i}`, {
+            subnetId: subnet.id,
+            routeTableId: privateRouteTable.id,
+        });
+    });
+
+
 });
 
 
