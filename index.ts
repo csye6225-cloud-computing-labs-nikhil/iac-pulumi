@@ -1,6 +1,7 @@
 import * as aws from "@pulumi/aws";
 import * as pulumi from "@pulumi/pulumi";
 import * as ip from "ip";
+
 const config = new pulumi.Config("iac-aws");
 
 console.log(config);
@@ -25,8 +26,10 @@ const privateRouteTableSubnetsAssociationPrefix = config.require("private_route_
 const securityGroupDescription = config.require("securityGroupDescription");
 const securityGroupName = config.require("securityGroupName");
 const allowedIngressPorts = config.require("allowedIngressPorts").split(",");
+const allowedEgressPorts = config.require("allowedEgressPorts").split(",");
 const allowedIngressCIDRs = config.require("allowedIngressCIDRs").split(",");
-
+const allowedEgressCIDRs = config.require("allowedEgressCIDRs").split(",");
+const dbPort = config.requireNumber("dbPort");
 
 // Create VPC
 const vpc = new aws.ec2.Vpc(vpcName, {
@@ -44,6 +47,13 @@ const ingressRules = allowedIngressPorts.map(port => ({
     cidrBlocks: allowedIngressCIDRs,
 }));
 
+const egressRules = allowedEgressPorts.map(port => ({
+    protocol: "tcp",
+    fromPort: parseInt(port, 10),
+    toPort: parseInt(port, 10),
+    cidrBlocks: allowedEgressCIDRs
+}));
+
 const appSecurityGroup = new aws.ec2.SecurityGroup(securityGroupName, {
     vpcId: vpc.id,
     description: securityGroupDescription,
@@ -51,6 +61,7 @@ const appSecurityGroup = new aws.ec2.SecurityGroup(securityGroupName, {
         Name: securityGroupName,
     },
     ingress: ingressRules,
+    egress: egressRules
 });
 
 const instanceType = config.require("instanceType");
@@ -60,6 +71,39 @@ const volumeSize = config.getNumber("volumeSize");
 const volumeType = config.require("volumeType");
 const deleteOnTermination = config.getBoolean("deleteOnTermination");
 const ec2Name = config.require("ec2Name");
+const ENV_TYPE = config.require("envType");
+
+const multiAZDeployment = config.requireBoolean("multiAZDeployment");
+const dbSecurityGroupName = config.require("dbSecurityGroupName");
+const dbParameterGroupName = config.require("dbParameterGroupName");
+const dbInstanceIdentifier = config.require("dbInstanceIdentifier");
+const allocatedStorage = parseInt(config.require("allocatedStorage"));
+const dbSubnetGroupName = config.require("dbSubnetGroupName");
+const dbName = config.require("dbName");
+const dbUser = config.require("dbUser");
+const dbPassword = config.require("dbPassword");
+const dbDialect = config.get("dbDialect") || "postgres";
+
+
+const dbSecurityGroup = new aws.ec2.SecurityGroup(dbSecurityGroupName, {
+    vpcId: vpc.id,
+    description: "Database security group for RDS",
+    tags: {
+        Name: dbSecurityGroupName,
+    },
+    ingress: [{
+        protocol: "tcp",
+        fromPort: dbPort,
+        toPort: dbPort,
+        securityGroups: [appSecurityGroup.id]
+    }]
+});
+
+const dbParameterGroup = new aws.rds.ParameterGroup(dbParameterGroupName, {
+    family: "postgres15",
+    description: "Custom parameter group",
+});
+
 
 async function provisioner() {
     try {
@@ -82,12 +126,12 @@ async function provisioner() {
             },
         });
 
-        const igAttachment = new aws.ec2.InternetGatewayAttachment(internetGatewayAttachmentName, {
+        const igAttachment = await new aws.ec2.InternetGatewayAttachment(internetGatewayAttachmentName, {
             vpcId: vpc.id,
             internetGatewayId: internetGateway.id,
         });
 
-        const publicRouteTable = new aws.ec2.RouteTable(publicRouteTableName, {
+        const publicRouteTable = await new aws.ec2.RouteTable(publicRouteTableName, {
             vpcId: vpc.id,
             tags: {
                 Name: publicRouteTableName,
@@ -149,19 +193,56 @@ async function provisioner() {
         // console.log(`VPC ID: ${vpc.id}`);
         // console.log(`Security Group VPC ID: ${appSecurityGroup.vpcId}`);
         // console.log(`Public Subnet VPC ID: ${publicSubnets[0]?.vpcId}`);
+        const dbSubnetGroupResource = await new aws.rds.SubnetGroup(dbSubnetGroupName, {
+            subnetIds: privateSubnets.map(subnet => subnet.id),
+            tags: {
+                Name: dbSubnetGroupName,
+            },
+        });
 
-        const ec2Instance = new aws.ec2.Instance(ec2Name, {
+        const rdsInstance = await new aws.rds.Instance(dbInstanceIdentifier, {
+            engine: "postgres",
+            instanceClass: "db.t3.micro",
+            allocatedStorage: allocatedStorage,
+            dbSubnetGroupName: dbSubnetGroupResource.name,
+            multiAz: multiAZDeployment,
+            vpcSecurityGroupIds: [dbSecurityGroup.id],
+            name: dbName,
+            username: dbUser,
+            password: dbPassword,
+            parameterGroupName: dbParameterGroup.name,
+            skipFinalSnapshot: true,
+            publiclyAccessible: false,
+        });
+
+        const endpoint = rdsInstance.endpoint;
+        const rdsHost = endpoint.apply(ep => ep.split(':')[0]);
+        const rdsUser = dbUser;
+        const rdsPassword = dbPassword;
+
+        const userDataScript = pulumi.interpolate`#!/bin/bash
+# Define your environment variables in a .env file
+echo "DB_HOST=${rdsHost}" > /home/webapp_user/webapp/.env
+echo "DB_DIALECT=${dbDialect}" >> /home/webapp_user/webapp/.env
+echo "DB_USERNAME=${rdsUser}" >> /home/webapp_user/webapp/.env
+echo "DB_PASSWORD=${rdsPassword}" >> /home/webapp_user/webapp/.env
+echo "DB_NAME=${dbName}" >> /home/webapp_user/webapp/.env
+echo "DB_PORT=${dbPort}" >> /home/webapp_user/webapp/.env
+echo "ENV_TYPE=${ENV_TYPE}" >> /home/webapp_user/webapp/.env
+`;
+
+        const ec2Instance = await new aws.ec2.Instance(ec2Name, {
             instanceType: instanceType,
             ami: imageId,
             keyName: keyName,
             subnetId: publicSubnets[0]?.id,
             vpcSecurityGroupIds: [appSecurityGroup.id],
+            userData: userDataScript,
             disableApiTermination: config.getBoolean("disableApiTermination"),
             rootBlockDevice: {
                 volumeSize: volumeSize!,
                 volumeType: volumeType,
                 deleteOnTermination: deleteOnTermination!,
-                // deviceName: deviceName,
             },
             tags: {
                 Name: ec2Name,
