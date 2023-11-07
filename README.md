@@ -11,3 +11,7 @@ pulumi up
 pulumi destroy
 
 pulumi config set aws:region us-west-2
+
+
+sudo systemctl status csye6225_webapp
+journalctl -u csye6225_webapp

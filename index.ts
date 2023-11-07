@@ -4,8 +4,6 @@ import * as ip from "ip";
 
 const config = new pulumi.Config("iac-aws");
 
-console.log(config);
-
 const vpcName = config.require("vpc_name");
 const vpcCidr = config.require("vpc_cidr");
 const vpcInstanceTenancy = config.require("vpc_instance_tenancy");
@@ -30,6 +28,18 @@ const allowedEgressPorts = config.require("allowedEgressPorts").split(",");
 const allowedIngressCIDRs = config.require("allowedIngressCIDRs").split(",");
 const allowedEgressCIDRs = config.require("allowedEgressCIDRs").split(",");
 const dbPort = config.requireNumber("dbPort");
+
+
+const domainName = config.require("domainName");
+const applicationPort = config.require("applicationPort");
+const hostedZoneId = config.require("hostedZoneId");
+const ttl = config.requireNumber("ttl");
+const route53ARecordName = config.require("route53ARecordName");
+
+const cloudWatchPolicyName = config.require("cloudWatchAgentServerPolicyName");
+const ec2RoleName = config.require("ec2RoleName");
+const policyAttachmentName = config.require("cloudWatchAgentPolicyAttachmentName");
+const instanceProfileName = config.require("instanceProfileName");
 
 // Create VPC
 const vpc = new aws.ec2.Vpc(vpcName, {
@@ -229,8 +239,64 @@ echo "DB_PASSWORD=${rdsPassword}" >> /home/webapp_user/webapp/.env
 echo "DB_NAME=${dbName}" >> /home/webapp_user/webapp/.env
 echo "DB_PORT=${dbPort}" >> /home/webapp_user/webapp/.env
 echo "ENV_TYPE=${ENV_TYPE}" >> /home/webapp_user/webapp/.env
+
+# Configure the CloudWatch Agent
+sudo /usr/bin/amazon-cloudwatch-agent-ctl \\
+    -a fetch-config \\
+    -m ec2 \\
+    -c file:/opt/cloudwatch-config.json \\
+    -s
+# Restart the CloudWatch Agent to apply any updates
+sudo systemctl restart amazon-cloudwatch-agent
+sudo systemctl restart csye6225_webapp
 `;
 
+        const cloudWatchAgentServerPolicy = new aws.iam.Policy(cloudWatchPolicyName, {
+            description: "Allows EC2 instances to report metrics to CloudWatch",
+            policy: {
+                Version: "2012-10-17",
+                Statement: [
+                    {
+                        Effect: "Allow",
+                        Action: [
+                            "cloudwatch:PutMetricData",
+                            "ec2:DescribeVolumes",
+                            "ec2:DescribeTags",
+                            "logs:PutLogEvents",
+                            "logs:DescribeLogStreams",
+                            "logs:DescribeLogGroups",
+                            "logs:CreateLogStream",
+                            "logs:CreateLogGroup"
+                        ],
+                        Resource: "*",
+                    },
+                    {
+                        Effect: "Allow",
+                        Action: "ssm:GetParameter",
+                        Resource: "arn:aws:ssm:*:*:parameter/AmazonCloudWatch-*",
+                    },
+                ],
+            },
+        });
+
+
+        // Create an IAM Role for the EC2 instance
+        const ec2Role = new aws.iam.Role(ec2RoleName, {
+            assumeRolePolicy: aws.iam.assumeRolePolicyForPrincipal({
+                Service: "ec2.amazonaws.com",
+            }),
+        });
+
+        // Attach the IAM Policy to the Role
+        const rolePolicyAttachment = new aws.iam.RolePolicyAttachment(policyAttachmentName, {
+            role: ec2Role.name,
+            policyArn: cloudWatchAgentServerPolicy.arn,
+        });
+
+        // Create the Instance Profile for the Role
+        const instanceProfile = new aws.iam.InstanceProfile(instanceProfileName, {
+            role: ec2Role.name,
+        });
         const ec2Instance = await new aws.ec2.Instance(ec2Name, {
             instanceType: instanceType,
             ami: imageId,
@@ -238,6 +304,7 @@ echo "ENV_TYPE=${ENV_TYPE}" >> /home/webapp_user/webapp/.env
             subnetId: publicSubnets[0]?.id,
             vpcSecurityGroupIds: [appSecurityGroup.id],
             userData: userDataScript,
+            iamInstanceProfile: instanceProfile.name,
             disableApiTermination: config.getBoolean("disableApiTermination"),
             rootBlockDevice: {
                 volumeSize: volumeSize!,
@@ -247,6 +314,16 @@ echo "ENV_TYPE=${ENV_TYPE}" >> /home/webapp_user/webapp/.env
             tags: {
                 Name: ec2Name,
             },
+        });
+
+        const publicIp = ec2Instance.publicIp;
+
+        const aRecord = new aws.route53.Record(route53ARecordName, {
+            zoneId: hostedZoneId,
+            name: domainName,
+            type: "A",
+            ttl: ttl,
+            records: [publicIp],
         });
 
     } catch (error) {
