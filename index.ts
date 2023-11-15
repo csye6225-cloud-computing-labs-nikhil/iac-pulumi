@@ -41,6 +41,16 @@ const ec2RoleName = config.require("ec2RoleName");
 const policyAttachmentName = config.require("cloudWatchAgentPolicyAttachmentName");
 const instanceProfileName = config.require("instanceProfileName");
 
+const launchConfigurationName = config.require("launchConfigurationName");
+const autoScalingGroupName = config.require("autoScalingGroupName");
+const loadBalancerSecurityGroupName = config.require("loadBalancerSecurityGroupName");
+
+const autoScalingCooldown = config.getNumber("autoScalingCooldown");
+const autoScalingMinSize = config.getNumber("autoScalingMinSize") || 1;
+const autoScalingMaxSize = config.getNumber("autoScalingMaxSize") || 3;
+const autoScalingDesiredCapacity = config.getNumber("autoScalingDesiredCapacity") || 1;
+const loadBalancerAllowedIngressPorts = config.require("loadBalancerAllowedIngressPorts").split(",");
+
 // Create VPC
 const vpc = new aws.ec2.Vpc(vpcName, {
     cidrBlock: vpcCidr,
@@ -50,12 +60,18 @@ const vpc = new aws.ec2.Vpc(vpcName, {
     },
 });
 
-const ingressRules = allowedIngressPorts.map(port => ({
-    protocol: "tcp",
-    fromPort: parseInt(port, 10),
-    toPort: parseInt(port, 10),
-    cidrBlocks: allowedIngressCIDRs,
-}));
+// Create Load Balancer Security Group
+const lbSecurityGroup = new aws.ec2.SecurityGroup(loadBalancerSecurityGroupName, {
+    vpcId: vpc.id,
+    ingress: loadBalancerAllowedIngressPorts.map(port => ({
+        protocol: "tcp",
+        fromPort: parseInt(port.trim(), 10),
+        toPort: parseInt(port.trim(), 10),
+        cidrBlocks: ["0.0.0.0/0"]
+    })),
+    egress: [{ protocol: "-1", fromPort: 0, toPort: 0, cidrBlocks: ["0.0.0.0/0"] }],
+    tags: { Name: loadBalancerSecurityGroupName },
+});
 
 const egressRules = allowedEgressPorts.map(port => ({
     protocol: "tcp",
@@ -63,6 +79,11 @@ const egressRules = allowedEgressPorts.map(port => ({
     toPort: parseInt(port, 10),
     cidrBlocks: allowedEgressCIDRs
 }));
+
+const ingressRules = [
+    { protocol: "tcp", fromPort: 22, toPort: 22, cidrBlocks: ["0.0.0.0/0"] },
+    { protocol: "tcp", fromPort: 8080, toPort: 8080, securityGroups: [lbSecurityGroup.id] },
+];
 
 const appSecurityGroup = new aws.ec2.SecurityGroup(securityGroupName, {
     vpcId: vpc.id,
@@ -316,14 +337,138 @@ sudo systemctl restart csye6225_webapp
             },
         });
 
+        const userDataEncoded = userDataScript.apply(ud => Buffer.from(ud).toString('base64'));
+
+        const launchTemplate = new aws.ec2.LaunchTemplate(launchConfigurationName, {
+            imageId: imageId,
+            instanceType: instanceType,
+            keyName: keyName,
+            networkInterfaces: [{
+                associatePublicIpAddress: "true",
+                securityGroups: [appSecurityGroup.id],
+            }],
+            userData: userDataEncoded,
+            iamInstanceProfile: {
+                name: instanceProfile.name,
+            },
+            tagSpecifications: [{
+                resourceType: "instance",
+                tags: {
+                    Name: "autoscale-ec2",
+                }
+            }],
+        });
+
+        const targetGroup = new aws.lb.TargetGroup("targetGroup", {
+            port: 8080,  // The port your application listens on
+            protocol: "HTTP",
+            vpcId: vpc.id,
+            targetType: "instance",
+            healthCheck: {
+                enabled: true,
+                path: "/healthz", // Assuming the root path for health checks
+                protocol: "HTTP",
+            },
+        });
+
+        const autoScalingGroup = new aws.autoscaling.Group(autoScalingGroupName, {
+            vpcZoneIdentifiers: publicSubnets.map(subnet => subnet.id),
+            maxSize: autoScalingMaxSize,
+            minSize: autoScalingMinSize,
+            desiredCapacity: autoScalingDesiredCapacity,
+            launchTemplate: {
+                id: launchTemplate.id,
+                version: "$Latest",
+            },
+            tags: [
+                {
+                    key: "AutoScalingGroup",
+                    value: "autoscale-ec2",
+                    propagateAtLaunch: true,
+                },
+            ],
+            targetGroupArns: [targetGroup.arn]
+        });
+
+
+        // Scale Up Policy
+        const scaleUpPolicy = new aws.autoscaling.Policy("scaleUpPolicy", {
+            autoscalingGroupName: autoScalingGroup.name,
+            adjustmentType: "ChangeInCapacity",
+            scalingAdjustment: 1,
+            cooldown: autoScalingCooldown,
+            policyType: "SimpleScaling",
+        });
+
+        // Scale Down Policy
+        const scaleDownPolicy = new aws.autoscaling.Policy("scaleDownPolicy", {
+            autoscalingGroupName: autoScalingGroup.name,
+            adjustmentType: "ChangeInCapacity",
+            scalingAdjustment: -1,
+            cooldown: autoScalingCooldown,
+            policyType: "SimpleScaling",
+        });
+
+        // High CPU Utilization Alarm (for Scale Up)
+        const highCpuAlarm = new aws.cloudwatch.MetricAlarm("highCpuAlarm", {
+            comparisonOperator: "GreaterThanThreshold",
+            evaluationPeriods: 2,
+            metricName: "CPUUtilization",
+            namespace: "AWS/EC2",
+            period: 60,
+            statistic: "Average",
+            threshold: 5,
+            alarmActions: [scaleUpPolicy.arn], // Link to scale up policy
+            dimensions: {
+                AutoScalingGroupName: autoScalingGroup.name,
+            },
+            actionsEnabled: true
+        });
+
+        // Low CPU Utilization Alarm (for Scale Down)
+        const lowCpuAlarm = new aws.cloudwatch.MetricAlarm("lowCpuAlarm", {
+            comparisonOperator: "LessThanThreshold",
+            evaluationPeriods: 2,
+            metricName: "CPUUtilization",
+            namespace: "AWS/EC2",
+            period: 60,
+            statistic: "Average",
+            threshold: 3,
+            alarmActions: [scaleDownPolicy.arn], // Link to scale down policy
+            dimensions: {
+                AutoScalingGroupName: autoScalingGroup.name,
+            },
+            actionsEnabled: true
+        });
+
         const publicIp = ec2Instance.publicIp;
+
+        // Application Load Balancer
+        const alb = new aws.lb.LoadBalancer("appLoadBalancer", {
+            internal: false,
+            loadBalancerType: "application",
+            securityGroups: [lbSecurityGroup.id],
+            subnets: publicSubnets.map(subnet => subnet.id),
+            enableHttp2: true,
+            tags: { Name: "appLoadBalancer" },
+        });
+
+        const listener = new aws.lb.Listener("listener", {
+            loadBalancerArn: alb.arn,
+            port: 80,
+            protocol: "HTTP",
+            defaultActions: [{
+                type: "forward",
+                targetGroupArn: targetGroup.arn,
+            }],
+        });
+
 
         const aRecord = new aws.route53.Record(route53ARecordName, {
             zoneId: hostedZoneId,
             name: domainName,
             type: "A",
-            ttl: ttl,
-            records: [publicIp],
+            aliases: [{ name: alb.dnsName, zoneId: alb.zoneId, evaluateTargetHealth: true }],
         });
 
     } catch (error) {
