@@ -1,6 +1,8 @@
 import * as aws from "@pulumi/aws";
 import * as pulumi from "@pulumi/pulumi";
 import * as ip from "ip";
+import * as gcp from "@pulumi/gcp";
+import * as path from "path";
 
 const config = new pulumi.Config("iac-aws");
 
@@ -30,6 +32,22 @@ const allowedEgressCIDRs = config.require("allowedEgressCIDRs").split(",");
 const dbPort = config.requireNumber("dbPort");
 
 
+// Set your GCP project ID
+const projectId = config.require("gcpProjectID");
+const gcpRegion = config.require("gcpRegion")
+const gcpBucketName = config.require("gcpBucketName")
+const gcpServiceAccountRolePermissions = config.require("gcpServiceAccountRolePermissions")
+ 
+// Lambda
+const lambdaIAMRoleCloudwatchPolicyARN = config.require("lambdaIAMRoleCloudwatchPolicyARN");
+const lambdaIAMRoleDynamoDBPolicyARN = config.require("lambdaIAMRoleDynamoDBPolicyARN");
+const lambdaFilePath = config.require("lambdaFilePath");
+const snsTopicName = config.require("snsTopicName");
+const mailGunAPIKEY = config.require("MAILGUN_API_KEY");
+const emailDomainName = config.require("emailDomainName");
+ 
+const dynamoDBTableName = config.require("dynamoDBTableName");
+
 const domainName = config.require("domainName");
 const applicationPort = config.require("applicationPort");
 const hostedZoneId = config.require("hostedZoneId");
@@ -50,6 +68,8 @@ const autoScalingMinSize = config.getNumber("autoScalingMinSize") || 1;
 const autoScalingMaxSize = config.getNumber("autoScalingMaxSize") || 3;
 const autoScalingDesiredCapacity = config.getNumber("autoScalingDesiredCapacity") || 1;
 const loadBalancerAllowedIngressPorts = config.require("loadBalancerAllowedIngressPorts").split(",");
+const ec2IAMRoleSNSPolicyARN = config.require("ec2IAMRoleSNSPolicyARN");
+
 
 // Create VPC
 const vpc = new aws.ec2.Vpc(vpcName, {
@@ -135,6 +155,8 @@ const dbParameterGroup = new aws.rds.ParameterGroup(dbParameterGroupName, {
     description: "Custom parameter group",
 });
 
+const snsTopic = new aws.sns.Topic(snsTopicName);
+const snsTopicArn = snsTopic.arn.apply(arn => arn);
 
 async function provisioner() {
     try {
@@ -251,6 +273,13 @@ async function provisioner() {
         const rdsUser = dbUser;
         const rdsPassword = dbPassword;
 
+         // Create an IAM Role for the EC2 instance
+         const ec2Role = new aws.iam.Role(ec2RoleName, {
+            assumeRolePolicy: aws.iam.assumeRolePolicyForPrincipal({
+                Service: "ec2.amazonaws.com",
+            }),
+        });
+
         const userDataScript = pulumi.interpolate`#!/bin/bash
 # Define your environment variables in a .env file
 echo "DB_HOST=${rdsHost}" > /home/webapp_user/webapp/.env
@@ -260,6 +289,7 @@ echo "DB_PASSWORD=${rdsPassword}" >> /home/webapp_user/webapp/.env
 echo "DB_NAME=${dbName}" >> /home/webapp_user/webapp/.env
 echo "DB_PORT=${dbPort}" >> /home/webapp_user/webapp/.env
 echo "ENV_TYPE=${ENV_TYPE}" >> /home/webapp_user/webapp/.env
+echo "SNS_ARN=${snsTopicArn}" >> /home/webapp_user/webapp/.env
 
 # Configure the CloudWatch Agent
 sudo /usr/bin/amazon-cloudwatch-agent-ctl \\
@@ -299,15 +329,6 @@ sudo systemctl restart csye6225_webapp
                 ],
             },
         });
-
-
-        // Create an IAM Role for the EC2 instance
-        const ec2Role = new aws.iam.Role(ec2RoleName, {
-            assumeRolePolicy: aws.iam.assumeRolePolicyForPrincipal({
-                Service: "ec2.amazonaws.com",
-            }),
-        });
-
         // Attach the IAM Policy to the Role
         const rolePolicyAttachment = new aws.iam.RolePolicyAttachment(policyAttachmentName, {
             role: ec2Role.name,
@@ -318,24 +339,30 @@ sudo systemctl restart csye6225_webapp
         const instanceProfile = new aws.iam.InstanceProfile(instanceProfileName, {
             role: ec2Role.name,
         });
-        // const ec2Instance = await new aws.ec2.Instance(ec2Name, {
-        //     instanceType: instanceType,
-        //     ami: imageId,
-        //     keyName: keyName,
-        //     subnetId: publicSubnets[0]?.id,
-        //     vpcSecurityGroupIds: [appSecurityGroup.id],
-        //     userData: userDataScript,
-        //     iamInstanceProfile: instanceProfile.name,
-        //     disableApiTermination: config.getBoolean("disableApiTermination"),
-        //     rootBlockDevice: {
-        //         volumeSize: volumeSize!,
-        //         volumeType: volumeType,
-        //         deleteOnTermination: deleteOnTermination!,
-        //     },
-        //     tags: {
-        //         Name: ec2Name,
-        //     },
-        // });
+
+        const snsPolicyAttachment = new aws.iam.PolicyAttachment("SNSPolicyAttachment", {
+            policyArn: ec2IAMRoleSNSPolicyARN,
+            roles: [ec2Role.name],
+        });
+
+        const ec2Instance = await new aws.ec2.Instance(ec2Name, {
+            instanceType: instanceType,
+            ami: imageId,
+            keyName: keyName,
+            subnetId: publicSubnets[0]?.id,
+            vpcSecurityGroupIds: [appSecurityGroup.id],
+            userData: userDataScript,
+            iamInstanceProfile: instanceProfile.name,
+            disableApiTermination: config.getBoolean("disableApiTermination"),
+            rootBlockDevice: {
+                volumeSize: volumeSize!,
+                volumeType: volumeType,
+                deleteOnTermination: deleteOnTermination!,
+            },
+            tags: {
+                Name: ec2Name,
+            },
+        });
 
         const userDataEncoded = userDataScript.apply(ud => Buffer.from(ud).toString('base64'));
 
@@ -441,7 +468,7 @@ sudo systemctl restart csye6225_webapp
             actionsEnabled: true
         });
 
-        // const publicIp = ec2Instance.publicIp;
+        const publicIp = ec2Instance.publicIp;
 
         // Application Load Balancer
         const alb = new aws.lb.LoadBalancer("appLoadBalancer", {
@@ -470,6 +497,21 @@ sudo systemctl restart csye6225_webapp
             type: "A",
             aliases: [{ name: alb.dnsName, zoneId: alb.zoneId, evaluateTargetHealth: true }],
         });
+
+        const bucket = new gcp.storage.Bucket('csye-webapp-bucket', {
+            location: 'US',
+        });
+        
+        // Create a Google Service Account with a specified account_id
+        const serviceAccount = new gcp.serviceaccount.Account('myServiceAccount', {
+            accountId: 'csye6225-service-id',
+        });
+        
+        // Create Google Service Account Keys
+        const serviceAccountKey = new gcp.serviceaccount.Key('myServiceAccountKey', {
+            serviceAccountId: serviceAccount.id,
+        });
+        
 
     } catch (error) {
         console.error("Error:", error);
@@ -507,5 +549,114 @@ function calculateCIDRSubnets(parentCIDR: string, numSubnets: number, bitsToMask
         return error as Error;
     }
 }
+
+// Create a Google Cloud Storage bucket
+const bucket = new gcp.storage.Bucket(gcpBucketName, {
+    forceDestroy: true,
+    location: gcpRegion,
+});
+
+// Create a Google Service Account
+const serviceAccount = new gcp.serviceaccount.Account("myServiceAccount", {
+    accountId: "awslambdaassignment",
+    project: projectId,
+    displayName: "Service Account for AWS Lambda assignment upload",
+});
+
+// Assign roles to the service account
+const roles = [
+    gcpServiceAccountRolePermissions,
+];
+
+for (const role of roles) {
+    const binding = new gcp.projects.IAMMember(`myServiceAccountBinding-${role}`, {
+        role: role,
+        member: serviceAccount.email.apply(email => `serviceAccount:${email}`),
+        project: projectId,
+    });
+}
+ 
+// Create Access Keys for the Google Service Account
+const serviceAccountKey = new gcp.serviceaccount.Key("myServiceAccountKey", {
+    serviceAccountId: serviceAccount.name,
+});
+ 
+const privateKeyAsString = pulumi.interpolate`${serviceAccountKey.privateKey}`;
+ 
+const privateKeyPlainString = privateKeyAsString.apply(value => {
+    return value;
+});
+ 
+// Configure IAM so that the AWS Lambda can be run.
+const lambdaIAMRole = new aws.iam.Role("lambdaIAMRole", {
+    assumeRolePolicy: {
+       Version: "2012-10-17",
+       Statement: [{
+          Action: "sts:AssumeRole",
+          Principal: {
+             Service: "lambda.amazonaws.com",
+          },
+          Effect: "Allow",
+          Sid: "",
+       }],
+    },
+});
+ 
+// Attach the CloudWatch Policy to the IAM Role
+const lambdacloudWatchPolicyAttachment = new aws.iam.PolicyAttachment("lambdacloudWatchPolicyAttachment", {
+    policyArn: lambdaIAMRoleCloudwatchPolicyARN,
+    roles: [lambdaIAMRole.name],
+});
+ 
+// Attach the DynamoDB Policy to the IAM Role
+const lambdaDynamoDBPolicyAttachment = new aws.iam.PolicyAttachment("lambdaDynamoDBPolicyAttachment", {
+    policyArn: lambdaIAMRoleDynamoDBPolicyARN,
+    roles: [lambdaIAMRole.name],
+});
+ 
+const dynamoDBTable = new aws.dynamodb.Table("dynamoDBTableName", {
+    name: dynamoDBTableName,
+    attributes: [
+        { name: "uniqueId", type: "S"},
+    ],
+    hashKey: "uniqueId",
+    readCapacity: 5,
+    writeCapacity: 5,
+});
+ 
+// Define your AWS Lambda function
+const lambdaFunction = new aws.lambda.Function("lambdaFunction", {
+    role: lambdaIAMRole.arn,
+    handler: "index.handler",
+    timeout: 300,
+    runtime: "nodejs16.x",
+    code: new pulumi.asset.AssetArchive({
+        ".": new pulumi.asset.FileArchive(path.join(lambdaFilePath)),
+    }),
+    //code: new pulumi.asset.FileArchive(lambdaFilePath),
+    environment : {
+        variables: {
+            DynamoDBName:dynamoDBTable.name,
+            domainName: emailDomainName,
+            bucketName: bucket.name,
+            privateKey: privateKeyPlainString,
+            MAILGUN_API_KEY: mailGunAPIKEY
+        },
+    },
+});
+ 
+// Subscribe Lambda function to SNS topic
+const snsSubscription = new aws.sns.TopicSubscription("lambdaSubscription", {
+    protocol: "lambda",
+    topic: snsTopicArn,
+    endpoint: lambdaFunction.arn,
+});
+ 
+const lambdaTriggerPoint = new aws.lambda.Permission("lambdaTriggerFunction", {
+    action: "lambda:InvokeFunction",
+    function: lambdaFunction.name,
+    principal: "sns.amazonaws.com",
+    sourceArn: snsTopic.arn,
+});
 
 provisioner()
