@@ -102,6 +102,7 @@ const egressRules = allowedEgressPorts.map(port => ({
 
 const ingressRules = [
     { protocol: "tcp", fromPort: 22, toPort: 22, securityGroups: [lbSecurityGroup.id]},
+    // { protocol: "tcp", fromPort: 22, toPort: 22, cidrBlocks: ["0.0.0.0/0"] },
     { protocol: "tcp", fromPort: 8080, toPort: 8080, securityGroups: [lbSecurityGroup.id] },
 ];
 
@@ -498,21 +499,6 @@ sudo systemctl restart csye6225_webapp
             aliases: [{ name: alb.dnsName, zoneId: alb.zoneId, evaluateTargetHealth: true }],
         });
 
-        const bucket = new gcp.storage.Bucket('csye-webapp-bucket', {
-            location: 'US',
-        });
-        
-        // Create a Google Service Account with a specified account_id
-        const serviceAccount = new gcp.serviceaccount.Account('myServiceAccount', {
-            accountId: 'csye6225-service-id',
-        });
-        
-        // Create Google Service Account Keys
-        const serviceAccountKey = new gcp.serviceaccount.Key('myServiceAccountKey', {
-            serviceAccountId: serviceAccount.id,
-        });
-        
-
     } catch (error) {
         console.error("Error:", error);
     }
@@ -558,7 +544,7 @@ const bucket = new gcp.storage.Bucket(gcpBucketName, {
 
 // Create a Google Service Account
 const serviceAccount = new gcp.serviceaccount.Account("myServiceAccount", {
-    accountId: "awslambdaassignment",
+    accountId: "csye6225-service-id",
     project: projectId,
     displayName: "Service Account for AWS Lambda assignment upload",
 });
@@ -577,8 +563,8 @@ for (const role of roles) {
 }
  
 // Create Access Keys for the Google Service Account
-const serviceAccountKey = new gcp.serviceaccount.Key("myServiceAccountKey", {
-    serviceAccountId: serviceAccount.name,
+const serviceAccountKey = new gcp.serviceaccount.Key("myGCPServiceAccountKey", {
+    serviceAccountId: serviceAccount.id,
 });
  
 const privateKeyAsString = pulumi.interpolate`${serviceAccountKey.privateKey}`;
@@ -640,7 +626,8 @@ const lambdaFunction = new aws.lambda.Function("lambdaFunction", {
             domainName: emailDomainName,
             bucketName: bucket.name,
             privateKey: privateKeyPlainString,
-            MAILGUN_API_KEY: mailGunAPIKEY
+            MAILGUN_API_KEY: mailGunAPIKEY,
+            emailCC: "karudsa1@gmail.com"
         },
     },
 });
