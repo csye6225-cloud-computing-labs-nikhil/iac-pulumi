@@ -5,6 +5,7 @@ import * as gcp from "@pulumi/gcp";
 import * as path from "path";
 
 const config = new pulumi.Config("iac-aws");
+const SSLCertificateARN = config.require("SSLCertificateARN");     
 
 const vpcName = config.require("vpc_name");
 const vpcCidr = config.require("vpc_cidr");
@@ -386,6 +387,7 @@ sudo systemctl restart csye6225_webapp
         const userDataEncoded = userDataScript.apply(ud => Buffer.from(ud).toString('base64'));
 
         const launchTemplate = new aws.ec2.LaunchTemplate(launchConfigurationName, {
+            name: launchConfigurationName,
             imageId: imageId,
             instanceType: instanceType,
             keyName: keyName,
@@ -418,6 +420,7 @@ sudo systemctl restart csye6225_webapp
         });
 
         const autoScalingGroup = new aws.autoscaling.Group(autoScalingGroupName, {
+            name: autoScalingGroupName,
             vpcZoneIdentifiers: publicSubnets.map(subnet => subnet.id),
             maxSize: autoScalingMaxSize,
             minSize: autoScalingMinSize,
@@ -499,10 +502,21 @@ sudo systemctl restart csye6225_webapp
             tags: { Name: "appLoadBalancer" },
         });
 
-        const listener = new aws.lb.Listener("listener", {
+        // const listener = new aws.lb.Listener("listener", {
+        //     loadBalancerArn: alb.arn,
+        //     port: 80,
+        //     protocol: "HTTP",
+        //     defaultActions: [{
+        //         type: "forward",
+        //         targetGroupArn: targetGroup.arn,
+        //     }],
+        // });
+
+        const httpsListener = new aws.lb.Listener("httpsListener", {
             loadBalancerArn: alb.arn,
-            port: 80,
-            protocol: "HTTP",
+            port: 443, 
+            protocol: "HTTPS",
+            certificateArn: SSLCertificateARN, // Attach the SSL certificate
             defaultActions: [{
                 type: "forward",
                 targetGroupArn: targetGroup.arn,
