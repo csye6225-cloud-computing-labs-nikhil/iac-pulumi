@@ -53,8 +53,7 @@ Before you begin, ensure you have the following prerequisites installed on your 
 
 - [Pulumi](https://www.pulumi.com/docs/get-started/install/) - Infrastructure as Code tool.
 - [AWS CLI](https://aws.amazon.com/cli/) - with valid AWS credentials configured.
-
-# Your Project Title
+- Install `gcloud` cli and login with `gcloud auth login` and `gcloud auth application-default login`
 
 ## 🚀 Getting Started
 
@@ -140,8 +139,6 @@ Pulumi automates the creation of networking resources for your application. Here
 ## 🛠️ Extending to Google Cloud
 
 Enable required google services in the project from the console.
-Install `gcloud` cli and login with `gcloud auth login`
-and `gcloud auth application-default login`
 Pulumi further extends its capabilities to Google Cloud by automating the following:
 
 1. **Creating Google Cloud Storage Bucket**: A secure place for your data.
